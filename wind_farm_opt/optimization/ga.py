@@ -1,6 +1,6 @@
 """遗传算法优化器。"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import numpy as np
@@ -11,6 +11,27 @@ from ..constraints.spacing import (
     compute_min_spacing_from_diameters,
     enforce_min_spacing,
 )
+from .evaluation import (
+    InfeasibleCandidate,
+    ObjectiveFailureError,
+    OptimizeResult,
+    evaluate_candidates,
+    require_finite,
+    require_int,
+    require_optional_int,
+    require_unit_interval,
+    report_failure,
+    validate_optimizer_inputs,
+)
+
+# 向后兼容：OptimizeResult / 异常类型统一在 evaluation 中定义。
+__all__ = [
+    "GAConfig",
+    "GeneticAlgorithm",
+    "OptimizeResult",
+    "InfeasibleCandidate",
+    "ObjectiveFailureError",
+]
 
 
 @dataclass
@@ -20,23 +41,23 @@ class GAConfig:
     Parameters
     ----------
     population_size : int
-        种群大小
+        种群大小（>= 2）
     max_generations : int
-        最大迭代代数
+        最大迭代代数（>= 1）
     crossover_rate : float
-        交叉概率
+        交叉概率，取值 [0, 1]
     mutation_rate : float
-        变异概率
+        变异概率，取值 [0, 1]
     mutation_strength : float
-        变异强度（坐标标准差占场地范围的比例）
+        变异强度（坐标标准差占场地范围的比例，>= 0）
     elite_ratio : float
-        精英保留比例
+        精英保留比例，取值 [0, 1)；且保留精英数必须严格小于种群大小
     tournament_size : int
-        锦标赛选择的规模
+        锦标赛选择的规模（1 <= tournament_size <= population_size）
     min_spacing_multiple : float
-        最小间距倍数（相对于转子直径）
+        最小间距倍数（相对于转子直径，> 0）
     penalty_factor : float
-        约束违反惩罚因子
+        约束违反/声明不可行的惩罚因子（> 0）
     seed : Optional[int]
         随机种子
     """
@@ -52,36 +73,33 @@ class GAConfig:
     penalty_factor: float = 1e6
     seed: Optional[int] = None
 
+    def __post_init__(self) -> None:
+        """在配置创建时完成范围与组合校验。"""
+        require_int("population_size", self.population_size, min_value=2)
+        require_int("max_generations", self.max_generations, min_value=1)
+        require_unit_interval("crossover_rate", self.crossover_rate)
+        require_unit_interval("mutation_rate", self.mutation_rate)
+        require_finite("mutation_strength", self.mutation_strength, non_negative=True)
+        require_unit_interval("elite_ratio", self.elite_ratio)
+        require_int("tournament_size", self.tournament_size, min_value=1)
+        require_finite(
+            "min_spacing_multiple", self.min_spacing_multiple, positive=True
+        )
+        require_finite("penalty_factor", self.penalty_factor, positive=True)
+        require_optional_int("seed", self.seed)
 
-@dataclass
-class OptimizeResult:
-    """优化结果。
+        if self.tournament_size > self.population_size:
+            raise ValueError(
+                f"tournament_size ({self.tournament_size}) 不能大于 "
+                f"population_size ({self.population_size})"
+            )
 
-    Parameters
-    ----------
-    best_positions : np.ndarray
-        最优风机位置 (N_turb, 2)
-    best_fitness : float
-        最优适应度（净AEP，MWh/year）
-    best_generation : int
-        找到最优解的代数
-    convergence_history : list[float]
-        每代最优适应度历史
-    mean_history : list[float]
-        每代平均适应度历史
-    final_population : np.ndarray
-        最终种群 (pop_size, N_turb*2)
-    final_fitness : np.ndarray
-        最终种群适应度 (pop_size,)
-    """
-
-    best_positions: np.ndarray
-    best_fitness: float
-    best_generation: int
-    convergence_history: list[float]
-    mean_history: list[float]
-    final_population: np.ndarray
-    final_fitness: np.ndarray
+        n_elite = max(1, int(self.population_size * self.elite_ratio))
+        if n_elite >= self.population_size:
+            raise ValueError(
+                f"精英保留数量 ({n_elite}) 必须严格小于种群大小 "
+                f"({self.population_size})，请调小 elite_ratio"
+            )
 
 
 class GeneticAlgorithm:
@@ -109,15 +127,24 @@ class GeneticAlgorithm:
         boundary : SiteBoundary
             场地边界
         fitness_fn : Callable[[np.ndarray], float]
-            适应度函数，输入位置数组 (N_turb, 2)，返回净AEP
+            适应度函数，输入位置数组 (N_turb, 2)，返回净AEP。
+            抛出 :class:`InfeasibleCandidate` 表示声明候选不可行（按惩罚
+            处理）；返回 NaN/Inf 或抛出其他异常视为评估器故障并立即终止。
         config : Optional[GAConfig]
             算法配置参数
         """
+        self.config = config if config is not None else GAConfig()
+        if not isinstance(self.config, GAConfig):
+            raise ValueError(
+                f"config 必须是 GAConfig，当前类型为 {type(self.config).__name__}"
+            )
+
         self.n_turbines = n_turbines
-        self.rotor_diameters = np.asarray(rotor_diameters, dtype=np.float64)
+        self.rotor_diameters = validate_optimizer_inputs(
+            n_turbines, rotor_diameters, boundary, fitness_fn
+        )
         self.boundary = boundary
         self.fitness_fn = fitness_fn
-        self.config = config if config is not None else GAConfig()
 
         self.rng = np.random.default_rng(self.config.seed)
 
@@ -132,7 +159,9 @@ class GeneticAlgorithm:
 
         self._best_positions = None
         self._best_fitness = -np.inf
-        self._best_generation = 0
+        self._best_generation = -1
+        self._has_feasible_best = False
+        self._total_declared_infeasible = 0
 
         self.convergence_history: list[float] = []
         self.mean_history: list[float] = []
@@ -197,25 +226,30 @@ class GeneticAlgorithm:
 
         return penalty
 
-    def _evaluate_population(self, population: np.ndarray) -> np.ndarray:
-        """评估整个种群的适应度（带惩罚）。"""
-        pop_size = population.shape[0]
-        fitness = np.zeros(pop_size, dtype=np.float64)
+    def _evaluate_population(
+        self, population: np.ndarray, generation: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """评估整个种群的适应度（带惩罚）。
 
-        for i in range(pop_size):
-            positions = population[i].reshape(self.n_turbines, 2)
+        几何违规或目标函数声明不可行的候选按明确惩罚处理；目标函数返回非
+        有限值或抛出非领域异常时抛出 :class:`ObjectiveFailureError` 立即
+        终止，索引、布局与原始原因保留在异常中。
+        """
+        penalties = np.array(
+            [self._compute_penalty(ind) for ind in population], dtype=np.float64
+        )
 
-            penalty = self._compute_penalty(population[i])
-
-            if penalty > 0:
-                fitness[i] = -penalty
-            else:
-                try:
-                    fitness[i] = self.fitness_fn(positions)
-                except Exception:
-                    fitness[i] = -self.config.penalty_factor
-
-        return fitness
+        fitness, feasible_mask, n_declared = evaluate_candidates(
+            self.fitness_fn,
+            population,
+            penalties,
+            self.n_turbines,
+            self.config.penalty_factor,
+            generation=generation,
+            algorithm="GA",
+        )
+        self._total_declared_infeasible += n_declared
+        return fitness, feasible_mask
 
     def _tournament_selection(
         self, population: np.ndarray, fitness: np.ndarray, n_select: int
@@ -275,6 +309,27 @@ class GeneticAlgorithm:
 
         return positions.flatten()
 
+    def _update_best(
+        self,
+        population: np.ndarray,
+        fitness: np.ndarray,
+        feasible_mask: np.ndarray,
+        generation: int,
+    ) -> None:
+        """仅在真实可行候选中更新已记录的最优解。"""
+        if not np.any(feasible_mask):
+            return
+
+        feasible_idx = np.flatnonzero(feasible_mask)
+        idx = feasible_idx[np.argmax(fitness[feasible_idx])]
+        if not self._has_feasible_best or fitness[idx] > self._best_fitness:
+            self._best_fitness = float(fitness[idx])
+            self._best_positions = population[idx].reshape(
+                self.n_turbines, 2
+            ).copy()
+            self._best_generation = generation
+            self._has_feasible_best = True
+
     def optimize(self, verbose: bool = True) -> OptimizeResult:
         """执行优化。
 
@@ -286,7 +341,14 @@ class GeneticAlgorithm:
         Returns
         -------
         OptimizeResult
-            优化结果
+            优化结果。当整个运行中没有任何可行候选时，``best_feasible``
+            为 ``False``，此时 ``best_*`` 仅为惩罚最小的诊断布局，不构成
+            有效最优解。
+
+        Raises
+        ------
+        ObjectiveFailureError
+            目标函数返回非有限值或抛出非领域异常时立即抛出。
         """
         pop_size = self.config.population_size
         max_gen = self.config.max_generations
@@ -303,69 +365,99 @@ class GeneticAlgorithm:
             print(f"场地面积: {self.boundary.area / 1e6:.2f} km²")
             print("=" * 35)
 
-        population = self._initialize_population(pop_size)
-        fitness = self._evaluate_population(population)
+        try:
+            population = self._initialize_population(pop_size)
+            fitness, feasible_mask = self._evaluate_population(population, 0)
+            self._update_best(population, fitness, feasible_mask, 0)
 
-        best_idx = np.argmax(fitness)
-        self._best_fitness = fitness[best_idx]
-        self._best_positions = population[best_idx].reshape(self.n_turbines, 2)
-        self._best_generation = 0
+            for gen in range(max_gen):
+                self.convergence_history.append(
+                    float(self._best_fitness) if self._has_feasible_best else np.nan
+                )
+                self.mean_history.append(float(np.mean(fitness)))
 
-        for gen in range(max_gen):
-            self.convergence_history.append(float(self._best_fitness))
-            self.mean_history.append(float(np.mean(fitness)))
+                elite_idx = np.argsort(fitness)[-n_elite:]
+                elites = population[elite_idx].copy()
 
-            elite_idx = np.argsort(fitness)[-n_elite:]
-            elites = population[elite_idx].copy()
-
-            parents = self._tournament_selection(population, fitness, pop_size - n_elite)
-
-            offspring = np.zeros((pop_size - n_elite, self.n_dim), dtype=np.float64)
-            for i in range(0, pop_size - n_elite, 2):
-                p1 = parents[i]
-                p2 = parents[(i + 1) % (pop_size - n_elite)]
-                c1 = self._crossover(p1, p2)
-                c2 = self._crossover(p2, p1)
-                offspring[i] = self._mutate(c1)
-                if i + 1 < pop_size - n_elite:
-                    offspring[i + 1] = self._mutate(c2)
-
-            for i in range(len(offspring)):
-                offspring[i] = self._repair(offspring[i])
-
-            population[:n_elite] = elites
-            population[n_elite:] = offspring
-
-            fitness = self._evaluate_population(population)
-
-            current_best_idx = np.argmax(fitness)
-            if fitness[current_best_idx] > self._best_fitness:
-                self._best_fitness = float(fitness[current_best_idx])
-                self._best_positions = population[current_best_idx].reshape(
-                    self.n_turbines, 2
-                ).copy()
-                self._best_generation = gen + 1
-
-            if verbose and (gen % 5 == 0 or gen == max_gen - 1):
-                print(
-                    f"Gen {gen+1:3d} | "
-                    f"Best: {self._best_fitness/1e3:8.2f} GWh | "
-                    f"Mean: {np.mean(fitness)/1e3:8.2f} GWh | "
-                    f"Found@Gen {self._best_generation}"
+                parents = self._tournament_selection(
+                    population, fitness, pop_size - n_elite
                 )
 
-        if verbose:
+                offspring = np.zeros(
+                    (pop_size - n_elite, self.n_dim), dtype=np.float64
+                )
+                for i in range(0, pop_size - n_elite, 2):
+                    p1 = parents[i]
+                    p2 = parents[(i + 1) % (pop_size - n_elite)]
+                    c1 = self._crossover(p1, p2)
+                    c2 = self._crossover(p2, p1)
+                    offspring[i] = self._mutate(c1)
+                    if i + 1 < pop_size - n_elite:
+                        offspring[i + 1] = self._mutate(c2)
+
+                for i in range(len(offspring)):
+                    offspring[i] = self._repair(offspring[i])
+
+                population[:n_elite] = elites
+                population[n_elite:] = offspring
+
+                fitness, feasible_mask = self._evaluate_population(
+                    population, gen + 1
+                )
+                self._update_best(population, fitness, feasible_mask, gen + 1)
+
+                if verbose and (gen % 5 == 0 or gen == max_gen - 1):
+                    n_feasible = int(np.count_nonzero(feasible_mask))
+                    if self._has_feasible_best:
+                        best_str = f"{self._best_fitness/1e3:8.2f} GWh"
+                    else:
+                        best_str = "     N/A"
+                    print(
+                        f"Gen {gen+1:3d} | "
+                        f"Best: {best_str} | "
+                        f"Mean: {np.mean(fitness)/1e3:8.2f} GWh | "
+                        f"可行候选: {n_feasible}/{pop_size} | "
+                        f"Found@Gen {self._best_generation}"
+                    )
+        except ObjectiveFailureError as error:
+            if verbose:
+                report_failure(error)
+            raise
+
+        if self._has_feasible_best:
+            best_positions = self._best_positions.copy()
+            best_fitness = float(self._best_fitness)
+            best_generation = self._best_generation
+        else:
+            # 全部候选无效：保留惩罚最小的布局仅作诊断，明确标记为无效。
+            diag_idx = int(np.argmax(fitness))
+            best_positions = population[diag_idx].reshape(self.n_turbines, 2).copy()
+            best_fitness = float(fitness[diag_idx])
+            best_generation = -1
+            if verbose:
+                print("=" * 35)
+                print(
+                    "警告: 整个优化过程中没有任何候选通过目标函数评估，"
+                    "不存在有效最优解！"
+                )
+                print(
+                    f"（返回的 best_* 仅为惩罚最小的诊断布局，"
+                    f"惩罚分: {best_fitness:.1f}）"
+                )
+
+        if verbose and self._has_feasible_best:
             print("=" * 35)
             print(f"优化完成!")
             print(f"最优净AEP: {self._best_fitness/1e3:.2f} GWh")
             print(f"找到最优解的代数: {self._best_generation}")
 
         return OptimizeResult(
-            best_positions=self._best_positions.copy(),
-            best_fitness=float(self._best_fitness),
-            best_generation=self._best_generation,
+            best_positions=best_positions,
+            best_fitness=best_fitness,
+            best_generation=best_generation,
             convergence_history=self.convergence_history.copy(),
             mean_history=self.mean_history.copy(),
             final_population=population.copy(),
             final_fitness=fitness.copy(),
+            best_feasible=self._has_feasible_best,
         )

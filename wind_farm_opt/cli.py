@@ -21,6 +21,7 @@ from .farm.aep import AEPCalculator, FarmResult
 from .optimization.baseline import generate_grid_layout
 from .optimization.ga import GeneticAlgorithm, GAConfig
 from .optimization.pso import ParticleSwarmOptimizer, PSOConfig
+from .optimization.evaluation import ObjectiveFailureError
 from .economy.costs import (
     EconomicAnalyzer,
     EconomicResult,
@@ -66,6 +67,8 @@ class WindFarmOptimizerCLI:
         self.optimized_positions: Optional[np.ndarray] = None
         self.optimized_result: Optional[FarmResult] = None
         self.optimize_result = None
+        self.optimization_failed: bool = False
+        self.optimization_error: Optional[str] = None
         self.economic_result: Optional[EconomicResult] = None
         self.sweep_results: Optional[dict] = None
 
@@ -154,7 +157,27 @@ class WindFarmOptimizerCLI:
             raise ValueError(f"未知的优化算法: {algo}")
 
         print(f"使用优化算法: {algo.upper()}")
-        self.optimize_result = optimizer.optimize(verbose=True)
+
+        try:
+            self.optimize_result = optimizer.optimize(verbose=True)
+        except ObjectiveFailureError as error:
+            # 评估器自身故障：不得继续把故障布局当作最优解评估或保存。
+            self.optimization_failed = True
+            self.optimization_error = str(error)
+            print("\n优化因目标函数故障提前终止，跳过优化结果的后续分析。",
+                  file=sys.stderr)
+            print(f"故障候选索引: {error.candidate_index}，"
+                  f"代/迭代: {error.generation}，原因: {error.description}",
+                  file=sys.stderr)
+            return
+
+        if not getattr(self.optimize_result, "best_feasible", True):
+            # 整个运行没有可行候选：best_* 仅为诊断布局，不得当作最优解。
+            self.optimization_failed = True
+            self.optimization_error = "整个优化过程中没有任何可行候选"
+            print("\n警告: 优化未找到任何可行候选，不存在有效最优解，"
+                  "跳过优化结果的后续分析。", file=sys.stderr)
+            return
 
         self.optimized_positions = self.optimize_result.best_positions
         self.optimized_result = self.aep_calc.compute_farm_aep(self.optimized_positions)
@@ -480,6 +503,21 @@ class WindFarmOptimizerCLI:
                 "lcoe_yuan_per_kwh": self.sweep_results["lcoe"],
             }
 
+        if self.optimization_failed:
+            results["optimization_status"] = {
+                "success": False,
+                "error": self.optimization_error,
+                "note": "优化因目标函数故障或全部候选无效而终止，"
+                        "不存在有效最优解，本文件不含 optimized 结果。",
+            }
+        elif self.optimize_result is not None:
+            results["optimization_status"] = {
+                "success": True,
+                "best_feasible": bool(
+                    getattr(self.optimize_result, "best_feasible", True)
+                ),
+            }
+
         results_path = os.path.join(output_dir, "results.json")
         with open(results_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
@@ -498,8 +536,15 @@ class WindFarmOptimizerCLI:
         run_sweep: bool = False,
         run_viz: bool = True,
         save: bool = True,
-    ) -> None:
-        """运行完整分析流程。"""
+    ) -> bool:
+        """运行完整分析流程。
+
+        Returns
+        -------
+        bool
+            ``True`` 表示优化环节产生了有效最优解（或未执行优化）；
+            ``False`` 表示优化因评估器故障或全部候选无效而失败。
+        """
         start_time = time.time()
 
         self._print_header("风电场机位布局优化分析")
@@ -513,6 +558,20 @@ class WindFarmOptimizerCLI:
 
         if run_opt:
             self.run_optimization()
+
+        if self.optimization_failed:
+            # 失败已明确上报；仍输出基线相关结果，但返回失败状态。
+            if run_econ:
+                self.run_economic_analysis()
+            if run_viz:
+                self.run_visualization()
+            if save:
+                self.save_results()
+            print(f"\n{'='*60}")
+            print(f"  分析结束，但优化未产生有效最优解！")
+            print(f"  原因: {self.optimization_error}")
+            print(f"{'='*60}\n")
+            return False
 
         if run_econ:
             self.run_economic_analysis()
@@ -533,6 +592,7 @@ class WindFarmOptimizerCLI:
         print(f"\n{'='*60}")
         print(f"  全部分析完成! 耗时: {elapsed:.1f} 秒")
         print(f"{'='*60}\n")
+        return True
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -787,7 +847,7 @@ def main() -> int:
     cli._max_turbines = args.max_turbines
 
     try:
-        cli.run_full_analysis(
+        success = cli.run_full_analysis(
             run_baseline=True,
             run_opt=not args.no_optimization,
             run_econ=not args.no_economic,
@@ -795,7 +855,7 @@ def main() -> int:
             run_viz=not args.no_plots,
             save=True,
         )
-        return 0
+        return 0 if success else 2
     except Exception as e:
         print(f"\n错误: {e}", file=sys.stderr)
         import traceback

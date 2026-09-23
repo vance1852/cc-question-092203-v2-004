@@ -304,7 +304,11 @@ def plot_convergence(
         )
 
     improvement = 0.0
-    if baseline_aep is not None and baseline_aep > 0:
+    if (
+        getattr(optimize_result, "best_feasible", True)
+        and baseline_aep is not None
+        and baseline_aep > 0
+    ):
         improvement = (optimize_result.best_fitness - baseline_aep) / baseline_aep * 100
 
     ax.set_xlabel("迭代代数")
@@ -313,12 +317,15 @@ def plot_convergence(
     ax.grid(True, alpha=0.3)
     ax.legend(loc="lower right")
 
-    info_text = (
-        f"最优解: {optimize_result.best_fitness/1e3:.2f} GWh\n"
-        f"找到代数: {optimize_result.best_generation}"
-    )
-    if improvement > 0:
-        info_text += f"\n相对提升: {improvement:.2f}%"
+    if getattr(optimize_result, "best_feasible", True):
+        info_text = (
+            f"最优解: {optimize_result.best_fitness/1e3:.2f} GWh\n"
+            f"找到代数: {optimize_result.best_generation}"
+        )
+        if improvement > 0:
+            info_text += f"\n相对提升: {improvement:.2f}%"
+    else:
+        info_text = "无可行候选\n(不存在有效最优解)"
 
     ax.text(
         0.02,

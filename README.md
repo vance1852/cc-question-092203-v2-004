@@ -22,6 +22,24 @@ python quick_test.py
 
 快速验证会覆盖模型、约束、年发电量、优化、经济性和图表生成，并在 `test_output/` 写入临时图片。该目录不会纳入版本控制。
 
+## 运行测试
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -q
+```
+
+GA 与 PSO 的共同测试覆盖：首个候选失败、搜索中途失败、合法惩罚（几何违规与 `InfeasibleCandidate` 声明）、全部候选无效，以及创建期配置校验。
+
+## 优化器故障处理约定
+
+GA/PSO 明确区分两类情况：
+
+- **候选不可行**：几何约束违规，或目标函数抛出 `wind_farm_opt.optimization.evaluation.InfeasibleCandidate` 主动声明不可行。此类候选按 `-penalty_factor` 的明确惩罚计入适应度，搜索继续。
+- **评估器故障**：目标函数返回 NaN/Inf 等非有限值，或抛出 `InfeasibleCandidate` 以外的异常（如维度不匹配）。此时立即抛出 `ObjectiveFailureError` 终止搜索，异常中保留故障候选的索引、布局 `(N, 2)`、代/迭代编号和原始异常；CLI 以退出码 2 结束，`results.json` 写入 `optimization_status.success=false`，不会把失败运行伪装成有效最优解。
+
+当整个运行没有任何可行候选时，`OptimizeResult.best_feasible` 为 `False`，`best_*` 仅为惩罚最小的诊断布局，不构成有效最优解。
+
 ## 完整分析
 
 ```bash

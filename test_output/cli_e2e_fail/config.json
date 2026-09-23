@@ -1,0 +1,38 @@
+{
+  "n_turbines": 5,
+  "turbine_model": "V126-3.45MW",
+  "wake_model": "jensen",
+  "wake_decay": 0.07,
+  "superposition_method": "sum_of_squares",
+  "boundary_type": "rectangular",
+  "boundary_params": {
+    "width": 3500,
+    "height": 3500,
+    "center_x": 0,
+    "center_y": 0
+  },
+  "wind_resource_type": "default",
+  "wind_resource_params": {
+    "num_sectors": 12,
+    "dominant_direction": 270.0,
+    "mean_speed": 8.5
+  },
+  "optimization": {
+    "algorithm": "pso",
+    "population_size": 6,
+    "max_iterations": 2,
+    "min_spacing_multiple": 5.0,
+    "seed": 42
+  },
+  "visualization": {
+    "save_dir": "test_output/cli_e2e_fail",
+    "save_plots": false,
+    "show_plots": false,
+    "plot_wake_heatmap": true
+  },
+  "economic": {
+    "electricity_price": 0.45,
+    "discount_rate": 0.06,
+    "enable_analysis": true
+  }
+}

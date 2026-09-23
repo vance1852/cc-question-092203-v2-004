@@ -1,0 +1,72 @@
+{
+  "config": {
+    "n_turbines": 5,
+    "turbine_model": "V126-3.45MW",
+    "wake_model": "jensen",
+    "min_spacing_multiple": 5.0
+  },
+  "site": {
+    "area_km2": 12.25,
+    "mean_wind_speed": 6.842500000000001
+  },
+  "baseline": {
+    "positions": [
+      [
+        -945.0,
+        -472.5
+      ],
+      [
+        0.0,
+        -472.5
+      ],
+      [
+        945.0,
+        -472.5
+      ],
+      [
+        -945.0,
+        472.5
+      ],
+      [
+        0.0,
+        472.5
+      ]
+    ],
+    "gross_aep_gwh": 33.60537704910404,
+    "net_aep_gwh": 30.198708709965764,
+    "wake_loss_pct": 10.1372715865097,
+    "capacity_factor": 19.98458653296656,
+    "turbine_losses": [
+      {
+        "idx": 0,
+        "wake_loss_pct": 0.4994191460245591,
+        "dominant_source": 4
+      },
+      {
+        "idx": 1,
+        "wake_loss_pct": 16.3960334981583,
+        "dominant_source": 3
+      },
+      {
+        "idx": 2,
+        "wake_loss_pct": 16.3960334981583,
+        "dominant_source": 4
+      },
+      {
+        "idx": 3,
+        "wake_loss_pct": 0.4994191460245591,
+        "dominant_source": 1
+      },
+      {
+        "idx": 4,
+        "wake_loss_pct": 16.89545264418287,
+        "dominant_source": 0
+      }
+    ]
+  },
+  "optimization_status": {
+    "success": false,
+    "error": "PSO目标函数评估失败并已终止（初始种群/粒子群，批内候选索引 0）: 目标函数抛出非领域异常 ValueError: 新评估函数维度错误",
+    "note": "优化因目标函数故障或全部候选无效而终止，不存在有效最优解，本文件不含 optimized 结果。"
+  }
+}

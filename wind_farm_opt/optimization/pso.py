@@ -1,6 +1,6 @@
 """粒子群优化器。"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import numpy as np
@@ -11,6 +11,25 @@ from ..constraints.spacing import (
     compute_min_spacing_from_diameters,
     enforce_min_spacing,
 )
+from .evaluation import (
+    InfeasibleCandidate,
+    ObjectiveFailureError,
+    OptimizeResult,
+    evaluate_candidates,
+    require_finite,
+    require_int,
+    require_optional_int,
+    report_failure,
+    validate_optimizer_inputs,
+)
+
+__all__ = [
+    "PSOConfig",
+    "ParticleSwarmOptimizer",
+    "OptimizeResult",
+    "InfeasibleCandidate",
+    "ObjectiveFailureError",
+]
 
 
 @dataclass
@@ -20,21 +39,21 @@ class PSOConfig:
     Parameters
     ----------
     swarm_size : int
-        粒子群大小
+        粒子群大小（>= 2）
     max_iterations : int
-        最大迭代次数
+        最大迭代次数（>= 1）
     inertia_weight : float
-        惯性权重 w
+        惯性权重 w（有限，>= 0）
     cognitive_coeff : float
-        认知系数 c1
+        认知系数 c1（有限，>= 0）
     social_coeff : float
-        社会系数 c2
+        社会系数 c2（有限，>= 0）
     max_velocity : float
-        最大速度（占场地范围的比例）
+        最大速度（占场地范围的比例，> 0）
     min_spacing_multiple : float
-        最小间距倍数（相对于转子直径）
+        最小间距倍数（相对于转子直径，> 0）
     penalty_factor : float
-        约束违反惩罚因子
+        约束违反/声明不可行的惩罚因子（> 0）
     seed : Optional[int]
         随机种子
     """
@@ -49,9 +68,35 @@ class PSOConfig:
     penalty_factor: float = 1e6
     seed: Optional[int] = None
 
+    def __post_init__(self) -> None:
+        """在配置创建时完成范围与组合校验。"""
+        require_int("swarm_size", self.swarm_size, min_value=2)
+        require_int("max_iterations", self.max_iterations, min_value=1)
+        require_finite("inertia_weight", self.inertia_weight, non_negative=True)
+        require_finite("cognitive_coeff", self.cognitive_coeff, non_negative=True)
+        require_finite("social_coeff", self.social_coeff, non_negative=True)
+        require_finite("max_velocity", self.max_velocity, positive=True)
+        require_finite(
+            "min_spacing_multiple", self.min_spacing_multiple, positive=True
+        )
+        require_finite("penalty_factor", self.penalty_factor, positive=True)
+        require_optional_int("seed", self.seed)
+
 
 class ParticleSwarmOptimizer:
-    """粒子群算法机位优化器。"""
+    """粒子群算法机位优化器。
+
+    与 :class:`~wind_farm_opt.optimization.ga.GeneticAlgorithm` 遵循完全一
+    致的候选评估与故障处理约定：
+
+    - 几何违规或目标函数抛出 :class:`InfeasibleCandidate`：按明确惩罚处理，
+      搜索继续；
+    - 目标函数返回 NaN/Inf 或抛出其他异常：抛出
+      :class:`ObjectiveFailureError` 立即终止，保留候选索引、布局与原始
+      原因；
+    - 整个运行没有可行候选时，结果的 ``best_feasible`` 为 ``False``，
+      ``best_*`` 仅为诊断布局，不构成有效最优解。
+    """
 
     def __init__(
         self,
@@ -61,11 +106,18 @@ class ParticleSwarmOptimizer:
         fitness_fn: Callable[[np.ndarray], float],
         config: Optional[PSOConfig] = None,
     ) -> None:
+        self.config = config if config is not None else PSOConfig()
+        if not isinstance(self.config, PSOConfig):
+            raise ValueError(
+                f"config 必须是 PSOConfig，当前类型为 {type(self.config).__name__}"
+            )
+
         self.n_turbines = n_turbines
-        self.rotor_diameters = np.asarray(rotor_diameters, dtype=np.float64)
+        self.rotor_diameters = validate_optimizer_inputs(
+            n_turbines, rotor_diameters, boundary, fitness_fn
+        )
         self.boundary = boundary
         self.fitness_fn = fitness_fn
-        self.config = config if config is not None else PSOConfig()
 
         self.rng = np.random.default_rng(self.config.seed)
 
@@ -93,7 +145,9 @@ class ParticleSwarmOptimizer:
 
         self._best_global_pos = None
         self._best_global_fitness = -np.inf
-        self._best_iteration = 0
+        self._best_iteration = -1
+        self._has_feasible_best = False
+        self._total_declared_infeasible = 0
 
         self.convergence_history: list[float] = []
         self.mean_history: list[float] = []
@@ -159,24 +213,30 @@ class ParticleSwarmOptimizer:
 
         return penalty
 
-    def _evaluate_particles(self, positions: np.ndarray) -> np.ndarray:
-        """评估所有粒子的适应度。"""
-        swarm_size = positions.shape[0]
-        fitness = np.zeros(swarm_size, dtype=np.float64)
+    def _evaluate_particles(
+        self, positions: np.ndarray, iteration: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """评估所有粒子的适应度。
 
-        for i in range(swarm_size):
-            penalty = self._compute_penalty(positions[i])
+        几何违规或目标函数声明不可行的粒子按明确惩罚处理；目标函数返回非
+        有限值或抛出非领域异常时抛出 :class:`ObjectiveFailureError` 立即
+        终止，索引、布局与原始原因保留在异常中。
+        """
+        penalties = np.array(
+            [self._compute_penalty(pos) for pos in positions], dtype=np.float64
+        )
 
-            if penalty > 0:
-                fitness[i] = -penalty
-            else:
-                pos_reshaped = positions[i].reshape(self.n_turbines, 2)
-                try:
-                    fitness[i] = self.fitness_fn(pos_reshaped)
-                except Exception:
-                    fitness[i] = -self.config.penalty_factor
-
-        return fitness
+        fitness, feasible_mask, n_declared = evaluate_candidates(
+            self.fitness_fn,
+            positions,
+            penalties,
+            self.n_turbines,
+            self.config.penalty_factor,
+            generation=iteration,
+            algorithm="PSO",
+        )
+        self._total_declared_infeasible += n_declared
+        return fitness, feasible_mask
 
     def _repair(self, positions_flat: np.ndarray) -> np.ndarray:
         """修复违反约束的粒子。"""
@@ -199,16 +259,21 @@ class ParticleSwarmOptimizer:
 
         return positions.flatten()
 
-    def optimize(self, verbose: bool = True) -> "OptimizeResult":
+    def optimize(self, verbose: bool = True) -> OptimizeResult:
         """执行优化。
 
         Returns
         -------
         OptimizeResult
-            优化结果
-        """
-        from .ga import OptimizeResult
+            优化结果。当整个运行中没有任何可行候选时，``best_feasible``
+            为 ``False``，此时 ``best_*`` 仅为惩罚最小的诊断布局，不构成
+            有效最优解。
 
+        Raises
+        ------
+        ObjectiveFailureError
+            目标函数返回非有限值或抛出非领域异常时立即抛出。
+        """
         swarm_size = self.config.swarm_size
         max_iter = self.config.max_iterations
 
@@ -226,79 +291,150 @@ class ParticleSwarmOptimizer:
             print(f"w={w}, c1={c1}, c2={c2}")
             print("=" * 35)
 
-        positions, velocities = self._initialize_swarm(swarm_size)
-        fitness = self._evaluate_particles(positions)
+        try:
+            positions, velocities = self._initialize_swarm(swarm_size)
+            fitness, feasible_mask = self._evaluate_particles(positions, 0)
 
-        best_personal_pos = positions.copy()
-        best_personal_fitness = fitness.copy()
+            best_personal_pos = positions.copy()
+            best_personal_fitness = fitness.copy()
+            # 仅有真实可行的粒子才持有有效的个人历史最优。
+            best_personal_feasible = feasible_mask.copy()
 
-        best_global_idx = np.argmax(fitness)
-        self._best_global_pos = positions[best_global_idx].reshape(self.n_turbines, 2).copy()
-        self._best_global_fitness = float(fitness[best_global_idx])
-        self._best_iteration = 0
+            self._update_global_best(positions, fitness, feasible_mask, 0)
 
-        for iteration in range(max_iter):
-            self.convergence_history.append(float(self._best_global_fitness))
-            self.mean_history.append(float(np.mean(fitness)))
+            for iteration in range(max_iter):
+                self.convergence_history.append(
+                    float(self._best_global_fitness)
+                    if self._has_feasible_best
+                    else np.nan
+                )
+                self.mean_history.append(float(np.mean(fitness)))
 
-            r1 = self.rng.random((swarm_size, self.n_dim))
-            r2 = self.rng.random((swarm_size, self.n_dim))
+                r1 = self.rng.random((swarm_size, self.n_dim))
+                r2 = self.rng.random((swarm_size, self.n_dim))
 
-            best_global_flat = self._best_global_pos.flatten()
+                if self._has_feasible_best:
+                    best_global_flat = self._best_global_pos.flatten()
+                else:
+                    # 尚无可行全局最优：以当前粒子自身位置为引导，避免
+                    # None/惩罚布局把群体拖向无效区域。
+                    best_global_flat = positions
 
-            velocities = (
-                w * velocities
-                + c1 * r1 * (best_personal_pos - positions)
-                + c2 * r2 * (best_global_flat - positions)
-            )
-
-            velocities = np.clip(velocities, -self.vel_range, self.vel_range)
-
-            positions = positions + velocities
-
-            positions = np.clip(
-                positions,
-                self.pos_bounds[:, 0],
-                self.pos_bounds[:, 1],
-            )
-
-            for i in range(swarm_size):
-                positions[i] = self._repair(positions[i])
-
-            fitness = self._evaluate_particles(positions)
-
-            improved_mask = fitness > best_personal_fitness
-            best_personal_pos[improved_mask] = positions[improved_mask].copy()
-            best_personal_fitness[improved_mask] = fitness[improved_mask].copy()
-
-            current_best_idx = np.argmax(fitness)
-            if fitness[current_best_idx] > self._best_global_fitness:
-                self._best_global_fitness = float(fitness[current_best_idx])
-                self._best_global_pos = positions[current_best_idx].reshape(
-                    self.n_turbines, 2
-                ).copy()
-                self._best_iteration = iteration + 1
-
-            if verbose and (iteration % 5 == 0 or iteration == max_iter - 1):
-                print(
-                    f"Iter {iteration+1:3d} | "
-                    f"Best: {self._best_global_fitness/1e3:8.2f} GWh | "
-                    f"Mean: {np.mean(fitness)/1e3:8.2f} GWh | "
-                    f"Found@Iter {self._best_iteration}"
+                velocities = (
+                    w * velocities
+                    + c1 * r1 * (best_personal_pos - positions)
+                    + c2 * r2 * (best_global_flat - positions)
                 )
 
-        if verbose:
+                velocities = np.clip(velocities, -self.vel_range, self.vel_range)
+
+                positions = positions + velocities
+
+                positions = np.clip(
+                    positions,
+                    self.pos_bounds[:, 0],
+                    self.pos_bounds[:, 1],
+                )
+
+                for i in range(swarm_size):
+                    positions[i] = self._repair(positions[i])
+
+                fitness, feasible_mask = self._evaluate_particles(
+                    positions, iteration + 1
+                )
+
+                # 个人最优：可行粒子间直接比较；此前不可行的粒子一旦可行即
+                # 记录；不可行粒子之间按惩罚分更新，保证其个人历史不劣化。
+                improved = np.zeros(swarm_size, dtype=bool)
+                for i in range(swarm_size):
+                    if feasible_mask[i] and best_personal_feasible[i]:
+                        improved[i] = fitness[i] > best_personal_fitness[i]
+                    elif feasible_mask[i] and not best_personal_feasible[i]:
+                        improved[i] = True
+                    elif not feasible_mask[i] and not best_personal_feasible[i]:
+                        improved[i] = fitness[i] > best_personal_fitness[i]
+
+                best_personal_pos[improved] = positions[improved].copy()
+                best_personal_fitness[improved] = fitness[improved].copy()
+                best_personal_feasible[improved] = feasible_mask[improved]
+
+                self._update_global_best(
+                    positions, fitness, feasible_mask, iteration + 1
+                )
+
+                if verbose and (iteration % 5 == 0 or iteration == max_iter - 1):
+                    n_feasible = int(np.count_nonzero(feasible_mask))
+                    if self._has_feasible_best:
+                        best_str = f"{self._best_global_fitness/1e3:8.2f} GWh"
+                    else:
+                        best_str = "     N/A"
+                    print(
+                        f"Iter {iteration+1:3d} | "
+                        f"Best: {best_str} | "
+                        f"Mean: {np.mean(fitness)/1e3:8.2f} GWh | "
+                        f"可行粒子: {n_feasible}/{swarm_size} | "
+                        f"Found@Iter {self._best_iteration}"
+                    )
+        except ObjectiveFailureError as error:
+            if verbose:
+                report_failure(error)
+            raise
+
+        if self._has_feasible_best:
+            best_positions = self._best_global_pos.copy()
+            best_fitness = float(self._best_global_fitness)
+            best_iteration = self._best_iteration
+        else:
+            # 全部候选无效：保留惩罚最小的布局仅作诊断，明确标记为无效。
+            diag_idx = int(np.argmax(fitness))
+            best_positions = positions[diag_idx].reshape(self.n_turbines, 2).copy()
+            best_fitness = float(fitness[diag_idx])
+            best_iteration = -1
+            if verbose:
+                print("=" * 35)
+                print(
+                    "警告: 整个优化过程中没有任何候选通过目标函数评估，"
+                    "不存在有效最优解！"
+                )
+                print(
+                    f"（返回的 best_* 仅为惩罚最小的诊断布局，"
+                    f"惩罚分: {best_fitness:.1f}）"
+                )
+
+        if verbose and self._has_feasible_best:
             print("=" * 35)
             print(f"优化完成!")
             print(f"最优净AEP: {self._best_global_fitness/1e3:.2f} GWh")
             print(f"找到最优解的迭代: {self._best_iteration}")
 
         return OptimizeResult(
-            best_positions=self._best_global_pos.copy(),
-            best_fitness=float(self._best_global_fitness),
-            best_generation=self._best_iteration,
+            best_positions=best_positions,
+            best_fitness=best_fitness,
+            best_generation=best_iteration,
             convergence_history=self.convergence_history.copy(),
             mean_history=self.mean_history.copy(),
             final_population=positions.copy(),
             final_fitness=fitness.copy(),
+            best_feasible=self._has_feasible_best,
         )
+
+    def _update_global_best(
+        self,
+        positions: np.ndarray,
+        fitness: np.ndarray,
+        feasible_mask: np.ndarray,
+        iteration: int,
+    ) -> None:
+        """仅在真实可行粒子中更新全局最优。"""
+        if not np.any(feasible_mask):
+            return
+
+        feasible_idx = np.flatnonzero(feasible_mask)
+        idx = feasible_idx[np.argmax(fitness[feasible_idx])]
+        if not self._has_feasible_best or fitness[idx] > self._best_global_fitness:
+            self._best_global_fitness = float(fitness[idx])
+            self._best_global_pos = positions[idx].reshape(
+                self.n_turbines, 2
+            ).copy()
+            self._best_iteration = iteration
+            self._has_feasible_best = True
