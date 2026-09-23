@@ -156,6 +156,12 @@ class WindFarmOptimizerCLI:
         print(f"使用优化算法: {algo.upper()}")
         self.optimize_result = optimizer.optimize(verbose=True)
 
+        if not self.optimize_result.success:
+            # 全部候选无效：绝不能把惩罚值伪装成“优化后布局”继续下游分析。
+            raise RuntimeError(
+                f"优化失败：{self.optimize_result.message}"
+            )
+
         self.optimized_positions = self.optimize_result.best_positions
         self.optimized_result = self.aep_calc.compute_farm_aep(self.optimized_positions)
 
